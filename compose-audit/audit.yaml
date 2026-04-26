@@ -1,0 +1,414 @@
+name: Docker Compose Audit
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Get changed compose files
+        id: changed
+        run: |
+          BEFORE="${{ gitea.event.before }}"
+          AFTER="${{ gitea.sha }}"
+          if [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            FILES=$(git diff-tree --no-commit-id -r --name-only "$AFTER" \
+              | grep -E '(compose\.ya?ml|docker-compose.*\.ya?ml)' || true)
+          else
+            FILES=$(git diff --name-only "$BEFORE" "$AFTER" \
+              | grep -E '(compose\.ya?ml|docker-compose.*\.ya?ml)' || true)
+          fi
+          echo "Found changed compose files: $FILES"
+          echo "files=$(echo $FILES | tr '\n' ' ')" >> $GITEA_OUTPUT
+
+      - name: Install dependencies
+        run: pip install pyyaml -q --break-system-packages
+
+      - name: Run Compose Auditor
+        id: audit
+        env:
+          GITEA_TOKEN: ${{ secrets.REPO_TOKEN }}
+          GITEA_SERVER_URL: ${{ gitea.server_url }}
+          GITEA_REPOSITORY: ${{ gitea.repository }}
+          REF_NAME: ${{ gitea.ref_name }}
+          CHANGED_FILES: ${{ steps.changed.outputs.files }}
+          KOMODO_URL: ${{ secrets.KOMODO_URL }}
+          KOMODO_API_KEY: ${{ secrets.KOMODO_API_KEY }}
+          KOMODO_API_SECRET: ${{ secrets.KOMODO_API_SECRET }}
+        run: |
+          python3 << 'EOF'
+          import os, sys, glob, json, urllib.request, urllib.parse
+          from collections import defaultdict
+          import yaml
+
+          # ── Internal service fingerprints ────────────────────────────────────
+
+          INTERNAL_IMAGE_PATTERNS = [
+            "postgres", "postgresql",
+            "mysql", "mariadb",
+            "redis", "valkey", "keydb",
+            "mongo", "mongodb",
+            "memcached",
+            "rabbitmq",
+            "elasticsearch", "opensearch",
+            "influxdb",
+            "loki",
+            "promtail",
+            "ferretdb",
+          ]
+
+          INGRESS_NETWORK = "nginx"
+
+          def is_internal_service(svc):
+            image = svc.get("image", "").lower()
+            return any(p in image for p in INTERNAL_IMAGE_PATTERNS)
+
+          def get_service_networks(svc):
+            nets = svc.get("networks", [])
+            if isinstance(nets, dict):
+              return list(nets.keys())
+            return nets or []
+
+          def extract_id(obj):
+            if not obj:
+              return None
+            if isinstance(obj, str):
+              return obj
+            if "_id" in obj:
+              oid = obj["_id"]
+              if isinstance(oid, dict):
+                return oid.get("$oid")
+              return oid
+            return obj.get("id")
+
+          # ── Per-service hardening checks ─────────────────────────────────────
+
+          CHECKS = {
+            "no_new_privileges": lambda svc, _doc: (
+              "no-new-privileges:true" in " ".join(str(x) for x in svc.get("security_opt", []))
+            ),
+            "cap_drop_all": lambda svc, _doc: (
+              any(str(x).upper() == "ALL" for x in svc.get("cap_drop", []))
+            ),
+            "read_only_rootfs": lambda svc, _doc: svc.get("read_only", False),
+            "no_privileged": lambda svc, _doc: not svc.get("privileged", False),
+            "no_inline_env": lambda svc, _doc: "environment" not in svc,
+            "has_restart_policy": lambda svc, _doc: "restart" in svc,
+            "no_host_network": lambda svc, _doc: svc.get("network_mode", "") != "host",
+          }
+
+          LABELS = {
+            "no_new_privileges":  "Missing `security_opt: no-new-privileges:true`",
+            "cap_drop_all":       "Missing `cap_drop: [ALL]`",
+            "read_only_rootfs":   "Missing `read_only: true`",
+            "no_privileged":      "`privileged: true` is set — remove unless essential",
+            "no_inline_env":      "Inline `environment:` block — use `env_file: .env` instead",
+            "has_restart_policy": "No `restart:` policy defined",
+            "no_host_network":    "`network_mode: host` is set — prefer bridge networks",
+          }
+
+          def network_checks(path, doc):
+            findings = []
+            services = (doc or {}).get("services", {}) or {}
+            top_nets = (doc or {}).get("networks", {}) or {}
+
+            for svc_name, svc in services.items():
+              if not isinstance(svc, dict):
+                continue
+
+              svc_nets = get_service_networks(svc)
+
+              if is_internal_service(svc) and INGRESS_NETWORK in svc_nets:
+                findings.append(
+                  f"**{path}** → `{svc_name}`: Internal service (database/cache) "
+                  f"is attached to the `{INGRESS_NETWORK}` ingress network — "
+                  f"remove it and use an isolated internal network instead"
+                )
+
+              if is_internal_service(svc) and svc.get("ports"):
+                findings.append(
+                  f"**{path}** → `{svc_name}`: Internal service has `ports:` exposed "
+                  f"to the host — remove unless debugging locally"
+                )
+
+              if len(svc_nets) > 1:
+                has_internal = False
+                for net_name in svc_nets:
+                  net_def = top_nets.get(net_name, {}) or {}
+                  if net_def.get("internal", False):
+                    has_internal = True
+                    break
+                  inline = (svc.get("networks") or {})
+                  if isinstance(inline, dict):
+                    inline_def = inline.get(net_name, {}) or {}
+                    if isinstance(inline_def, dict) and inline_def.get("internal", False):
+                      has_internal = True
+                      break
+                if not has_internal:
+                  findings.append(
+                    f"**{path}** → `{svc_name}`: Service spans multiple networks "
+                    f"({', '.join(f'`{n}`' for n in svc_nets)}) but none are marked "
+                    f"`internal: true` — backend networks should be isolated"
+                  )
+
+            INTERNAL_NET_HINTS = ["db", "database", "internal", "backend", "cache", "private"]
+            for net_name, net_def in top_nets.items():
+              net_def = net_def or {}
+              if any(hint in net_name.lower() for hint in INTERNAL_NET_HINTS):
+                if not net_def.get("internal", False):
+                  findings.append(
+                    f"**{path}** → network `{net_name}`: Name suggests an internal "
+                    f"network but `internal: true` is not set"
+                  )
+
+            return findings
+
+          # ── Gitea helpers ────────────────────────────────────────────────────
+
+          GITEA_TOKEN      = os.environ["GITEA_TOKEN"]
+          GITEA_SERVER_URL = os.environ["GITEA_SERVER_URL"].rstrip("/")
+          GITEA_REPOSITORY = os.environ["GITEA_REPOSITORY"].strip()
+          REF_NAME         = os.environ["REF_NAME"]
+
+          GITEA_HEADERS = {
+            "Content-Type": "application/json",
+            "Authorization": f"token {GITEA_TOKEN}",
+          }
+
+          def gitea_get(path):
+            req = urllib.request.Request(
+              f"{GITEA_SERVER_URL}/api/v1{path}",
+              headers=GITEA_HEADERS,
+            )
+            with urllib.request.urlopen(req) as resp:
+              return json.loads(resp.read())
+
+          def gitea_post(path, payload):
+            req = urllib.request.Request(
+              f"{GITEA_SERVER_URL}/api/v1{path}",
+              data=json.dumps(payload).encode(),
+              headers=GITEA_HEADERS,
+              method="POST"
+            )
+            with urllib.request.urlopen(req) as resp:
+              return json.loads(resp.read())
+
+          def gitea_patch(path, payload):
+            req = urllib.request.Request(
+              f"{GITEA_SERVER_URL}/api/v1{path}",
+              data=json.dumps(payload).encode(),
+              headers=GITEA_HEADERS,
+              method="PATCH"
+            )
+            with urllib.request.urlopen(req) as resp:
+              return json.loads(resp.read())
+
+          def get_or_create_gitea_label(name):
+            labels = gitea_get(f"/repos/{GITEA_REPOSITORY}/labels?limit=50")
+            for label in labels:
+              if label["name"] == name:
+                return label["id"]
+            import hashlib
+            colour = hashlib.md5(name.encode()).hexdigest()[:6]
+            label = gitea_post(
+              f"/repos/{GITEA_REPOSITORY}/labels",
+              {"name": name, "color": f"#{colour}"}
+            )
+            return label["id"]
+
+          def find_open_issue(title):
+            page = 1
+            while True:
+              issues = gitea_get(
+                f"/repos/{GITEA_REPOSITORY}/issues"
+                f"?type=issues&state=open&limit=50&page={page}"
+              )
+              if not issues:
+                return None
+              for issue in issues:
+                if issue["title"] == title:
+                  return issue
+              if len(issues) < 50:
+                return None
+              page += 1
+
+          # ── Komodo helpers ───────────────────────────────────────────────────
+
+          KOMODO_URL        = os.environ.get("KOMODO_URL", "").rstrip("/")
+          KOMODO_API_KEY    = os.environ.get("KOMODO_API_KEY", "")
+          KOMODO_API_SECRET = os.environ.get("KOMODO_API_SECRET", "")
+          KOMODO_ENABLED    = bool(KOMODO_URL and KOMODO_API_KEY and KOMODO_API_SECRET)
+
+          KOMODO_HEADERS = {
+            "Content-Type": "application/json",
+            "X-Api-Key": KOMODO_API_KEY,
+            "X-Api-Secret": KOMODO_API_SECRET,
+          }
+
+          def komodo_read(req_type, params=None):
+            req = urllib.request.Request(
+              f"{KOMODO_URL}/read",
+              data=json.dumps({"type": req_type, "params": params or {}}).encode(),
+              headers=KOMODO_HEADERS,
+              method="POST"
+            )
+            try:
+              with urllib.request.urlopen(req) as resp:
+                return json.loads(resp.read())
+            except Exception as e:
+              print(f"  Warning: Komodo read failed ({req_type}): {e}")
+              return None
+
+          def komodo_write(req_type, params=None):
+            req = urllib.request.Request(
+              f"{KOMODO_URL}/write",
+              data=json.dumps({"type": req_type, "params": params or {}}).encode(),
+              headers=KOMODO_HEADERS,
+              method="POST"
+            )
+            try:
+              with urllib.request.urlopen(req) as resp:
+                return json.loads(resp.read())
+            except urllib.error.HTTPError as e:
+              body = e.read().decode()
+              print(f"  Warning: Komodo write failed ({req_type}): {e} — {body[:300]}")
+              return None
+            except Exception as e:
+              print(f"  Warning: Komodo write failed ({req_type}): {e}")
+              return None
+
+          def get_or_create_komodo_tag(tag_name):
+            tags = komodo_read("ListTags") or []
+            for tag in tags:
+              if tag.get("name") == tag_name:
+                return extract_id(tag)
+            result = komodo_write("CreateTag", {"name": tag_name})
+            return extract_id(result)
+
+          def set_stack_audit_tag(stack_name, passed):
+            PASS_TAG = "audit:pass"
+            FAIL_TAG = "audit:fail"
+            target_tag = PASS_TAG if passed else FAIL_TAG
+            remove_tag = FAIL_TAG if passed else PASS_TAG
+
+            stacks = komodo_read("ListStacks") or []
+            stack = next((s for s in stacks if s.get("name") == stack_name), None)
+            if not stack:
+              print(f"  Komodo: no stack named '{stack_name}' found — skipping tag")
+              return
+
+            stack_id  = extract_id(stack)
+            target_id = get_or_create_komodo_tag(target_tag)
+            remove_id = get_or_create_komodo_tag(remove_tag)
+
+            existing = [t if isinstance(t, str) else extract_id(t) for t in stack.get("tags", [])]
+            existing = [t for t in existing if t]
+            new_tags = [t for t in existing if t != remove_id]
+            if target_id and target_id not in new_tags:
+              new_tags.append(target_id)
+
+            komodo_write("UpdateResourceMeta", {
+              "target": {
+                "type": "Stack",
+                "id": stack_id,
+              },
+              "tags": new_tags,
+            })
+            print(f"  Komodo: tagged '{stack_name}' as {target_tag}")
+
+          # ── Resolve changed files ────────────────────────────────────────────
+
+          changed_env   = os.environ.get("CHANGED_FILES", "").strip()
+          compose_files = [f for f in changed_env.split() if f]
+
+          if not compose_files:
+            print("No compose files changed in this push.")
+            sys.exit(0)
+
+          print(f"Auditing {len(compose_files)} changed file(s): {compose_files}")
+
+          # ── Audit each changed file ──────────────────────────────────────────
+
+          service_findings = defaultdict(list)
+
+          for path in compose_files:
+            service = path.split("/")[0] if "/" in path else "root"
+
+            if not os.path.exists(path):
+              print(f"Skipping {path} — file not found (deleted?)")
+              continue
+
+            with open(path) as f:
+              try:
+                doc = yaml.safe_load(f)
+              except yaml.YAMLError as e:
+                service_findings[service].append(f"**{path}**: YAML parse error — {e}")
+                continue
+
+            services = (doc or {}).get("services", {})
+            for svc_name, svc in (services or {}).items():
+              if not isinstance(svc, dict):
+                continue
+              for check_name, check_fn in CHECKS.items():
+                try:
+                  if not check_fn(svc, doc):
+                    service_findings[service].append(
+                      f"**{path}** → `{svc_name}`: {LABELS[check_name]}"
+                    )
+                except Exception:
+                  pass
+
+            service_findings[service].extend(network_checks(path, doc))
+
+          # ── Create/update one issue per service, tag in Komodo ───────────────
+
+          for service, findings in service_findings.items():
+            issue_title = f"[Compose Audit] {service}: Hardening issues found"
+            passed      = len(findings) == 0
+
+            if passed:
+              print(f"{service}: All checks passed.")
+              existing = find_open_issue(issue_title)
+              if existing:
+                gitea_patch(
+                  f"/repos/{GITEA_REPOSITORY}/issues/{existing['number']}",
+                  {
+                    "state": "closed",
+                    "body": existing["body"] + (
+                      f"\n\n---\n_Automatically closed — all checks passed on `{REF_NAME}`._"
+                    )
+                  }
+                )
+                print(f"  Closed existing issue #{existing['number']}.")
+            else:
+              label_id = get_or_create_gitea_label(service)
+
+              body  = f"## Docker Compose Audit — `{service}`\n\n"
+              body += f"Branch: `{REF_NAME}`\n\n"
+              body += "\n".join(f"- {f}" for f in findings)
+              body += "\n\n---\n_Opened automatically by the Compose Audit workflow._"
+
+              existing = find_open_issue(issue_title)
+              if existing:
+                issue = gitea_patch(
+                  f"/repos/{GITEA_REPOSITORY}/issues/{existing['number']}",
+                  {"body": body, "labels": [label_id]}
+                )
+                print(f"  Updated issue #{issue['number']}: {issue['html_url']}")
+              else:
+                issue = gitea_post(
+                  f"/repos/{GITEA_REPOSITORY}/issues",
+                  {"title": issue_title, "body": body, "labels": [label_id]}
+                )
+                print(f"  Created issue #{issue['number']}: {issue['html_url']}")
+
+            if KOMODO_ENABLED:
+              set_stack_audit_tag(service, passed=passed)
+          EOF
